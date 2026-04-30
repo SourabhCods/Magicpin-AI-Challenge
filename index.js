@@ -167,6 +167,10 @@ app.post("/v1/reply", async (req, res) => {
     merchantData.category_slug || Object.keys(contexts.category)[0];
   const categoryData = categoryId ? contexts.category[categoryId]?.payload : {};
 
+  // Extract optional customer context if this is a customer-scoped conversation
+  const customerId = req.body.customer_id || null;
+  const customerData = customerId ? contexts.customer[customerId]?.payload : null;
+
   // Try to find the associated trigger from memory (optional, but helpful)
   const triggerId = Object.keys(contexts.trigger)[0];
   const triggerData = triggerId ? contexts.trigger[triggerId]?.payload : {};
@@ -178,6 +182,7 @@ app.post("/v1/reply", async (req, res) => {
     Category Context: ${JSON.stringify(categoryData)}
     Merchant Context: ${JSON.stringify(merchantData)}
     Trigger Context: ${JSON.stringify(triggerData)}
+    ${customerData ? `Customer Context: ${JSON.stringify(customerData)}` : ""}
 
     Merchant's message: "${message}"
     
