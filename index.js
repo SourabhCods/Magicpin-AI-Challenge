@@ -50,12 +50,11 @@ app.post("/v1/context", (req, res) => {
   // Idempotency / Version check
   const existing = contexts[scope][context_id];
   if (existing && existing.version >= version) {
-    // Ignore older or duplicate versions but still return 200 OK
-    return res.json({
-      accepted: true,
-      ack_id: `ack_noop_${Date.now()}`,
-      stored_at: new Date().toISOString(),
-      note: "ignored_due_to_version",
+    // Return 409 for stale or identical versions as per the official spec
+    return res.status(409).json({
+      accepted: false,
+      reason: "stale_version",
+      current_version: existing.version,
     });
   }
 
@@ -72,30 +71,26 @@ app.post("/v1/context", (req, res) => {
 // 4. Periodic Wake-up (Tick)
 app.post("/v1/tick", async (req, res) => {
   const { now, available_triggers } = req.body;
-  const actions = [];
 
-  // For simplicity in this stub, let's just pick the first trigger and the first merchant we have in memory
-  if (
-    available_triggers &&
-    available_triggers.length > 0 &&
-    Object.keys(contexts.merchant).length > 0
-  ) {
-    const triggerId = available_triggers[0];
-    const triggerData = contexts.trigger[triggerId]?.payload || {};
+  if (!available_triggers || available_triggers.length === 0 || Object.keys(contexts.merchant).length === 0) {
+    return res.json({ actions: [] });
+  }
 
-    // Extract the EXACT merchant intended for this trigger
-    const merchantId =
-      triggerData.merchant_id || Object.keys(contexts.merchant)[0];
-    const merchantData = contexts.merchant[merchantId]?.payload || {};
+  try {
+    // Process triggers concurrently (up to 5 max) to stay under the strict 10s timeout budget
+    const actionPromises = available_triggers.slice(0, 5).map(async (triggerId) => {
+      const triggerData = contexts.trigger[triggerId]?.payload || {};
+      const merchantId = triggerData.merchant_id || Object.keys(contexts.merchant)[0];
+      const merchantData = contexts.merchant[merchantId]?.payload || {};
+      
+      if (!merchantData.merchant_id) return null; // Skip if merchant isn't fully loaded
 
-    // Extract the EXACT category for this merchant
-    const categoryId =
-      merchantData.category_slug || Object.keys(contexts.category)[0];
-    const categoryData = categoryId
-      ? contexts.category[categoryId]?.payload
-      : {};
+      const categoryId = merchantData.category_slug || Object.keys(contexts.category)[0];
+      const categoryData = categoryId ? contexts.category[categoryId]?.payload : {};
+      const customerId = triggerData.customer_id || null;
+      const customerData = customerId ? contexts.customer[customerId]?.payload : null;
 
-    const prompt = `
+      const prompt = `
         You are Vera, an elite AI assistant for merchant growth at magicpin.
         Compose a short, highly-compelling business message to send to a merchant.
         
@@ -110,38 +105,55 @@ app.post("/v1/tick", async (req, res) => {
         Category Context: ${JSON.stringify(categoryData)}
         Merchant Context: ${JSON.stringify(merchantData)}
         Trigger Context: ${JSON.stringify(triggerData)}
+        ${customerData ? `Customer Context: ${JSON.stringify(customerData)}` : ""}
         
         Return ONLY a valid JSON object with this exact structure (no markdown):
         {
             "body": "The actual message to the merchant",
-            "cta": "open_ended or yes_no",
-            "suppression_key": "a unique string for this message type"
+            "cta": "open_ended or binary_yes_no",
+            "suppression_key": "a unique string for this message type",
+            "rationale": "A concise explanation of your reasoning"
         }
-        `;
+      `;
 
-    try {
-      const completion = await groq.chat.completions.create({
-        messages: [{ role: "user", content: prompt }],
-        model: "llama-3.3-70b-versatile",
-        temperature: 0,
-        response_format: { type: "json_object" },
-      });
+      try {
+        const completion = await groq.chat.completions.create({
+          messages: [{ role: "user", content: prompt }],
+          model: "llama-3.3-70b-versatile",
+          temperature: 0,
+          response_format: { type: "json_object" },
+        });
 
-      const result = JSON.parse(completion.choices[0].message.content);
+        const result = JSON.parse(completion.choices[0].message.content);
 
-      actions.push({
-        merchant_id: merchantId,
-        trigger_id: triggerId,
-        body: result.body,
-        cta: result.cta,
-        suppression_key: result.suppression_key || `trigger:${triggerId}`,
-      });
-    } catch (error) {
-      console.error("Groq API Error in /tick:", error);
-    }
+        return {
+          conversation_id: `conv_${merchantId}_${Date.now()}_${Math.floor(Math.random()*1000)}`,
+          merchant_id: merchantId,
+          customer_id: customerId,
+          send_as: customerId ? "merchant_on_behalf" : "vera",
+          trigger_id: triggerId,
+          body: result.body,
+          cta: result.cta,
+          suppression_key: result.suppression_key || `trigger:${triggerId}`,
+          rationale: result.rationale || "Processed via Groq",
+        };
+      } catch (err) {
+        console.error(`Groq API Error for trigger ${triggerId}:`, err);
+        return null; // Fail this specific trigger gracefully, but let the others succeed!
+      }
+    });
+
+    // Wait for all trigger LLM calls to finish
+    const results = await Promise.all(actionPromises);
+    
+    // Filter out any nulls
+    const actions = results.filter((a) => a !== null);
+
+    res.json({ actions });
+  } catch (error) {
+    console.error("Groq API Error in /tick:", error);
+    res.json({ actions: [] }); // Fail gracefully so the judge simulator doesn't crash
   }
-
-  res.json({ actions });
 });
 
 // 5. Handle Replies
@@ -181,6 +193,8 @@ app.post("/v1/reply", async (req, res) => {
     {
         "action": "send|wait|end", 
         "body": "The message text to send back (leave empty if wait/end)",
+        "cta": "open_ended or binary_yes_no (leave empty if wait/end)",
+        "wait_seconds": 14400,
         "rationale": "A concise explanation of why you chose this action based on the rules"
     }
     `;
@@ -195,18 +209,25 @@ app.post("/v1/reply", async (req, res) => {
 
     const result = JSON.parse(completion.choices[0].message.content);
 
-    res.json({
+    const responsePayload = {
       action: result.action || "wait",
       body: result.body || "",
+      cta: result.cta || "",
       rationale: result.rationale || "Processed via Groq",
-    });
+    };
+
+    if (result.action === "wait") {
+      responsePayload.wait_seconds = result.wait_seconds || 14400; // default to 4 hours if not specified
+    }
+
+    res.json(responsePayload);
   } catch (error) {
     console.error("Groq API Error in /reply:", error);
     res.json({ action: "wait", rationale: "Error generating response" });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Vera Bot server is running on port ${PORT}`);
 });
