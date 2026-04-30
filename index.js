@@ -186,7 +186,7 @@ app.post("/v1/reply", async (req, res) => {
     RULES:
     1. If the merchant is hostile, rude, or asks to stop messaging, action MUST be "end".
     2. If the merchant's message looks like an automated out-of-office or generic auto-reply, action MUST be "end".
-    3. If the merchant agrees or asks a follow-up, action should be "send" with a helpful response that continues to add value (e.g. drafting the asset they agreed to).
+    3. If the merchant agrees, commits ("lets do it"), or asks a follow-up, action MUST be "send". DO NOT ask another qualifying question. Immediately execute the task (e.g., write the ACTUAL drafted message text in your response).
     4. Rationale: Keep the rationale concise and strictly reflective of your actual reasoning.
     
     Return ONLY a valid JSON object with this exact structure (no markdown):
