@@ -118,13 +118,14 @@ app.post("/v1/tick", async (req, res) => {
             ? "1. Addressing: Address the CUSTOMER by their name from the Customer Context. DO NOT address the merchant. You are writing to the customer as the merchant."
             : "1. Owner Name: Always address the merchant by their 'owner_first_name' if available in the context. Do not use generic greetings."
         }
-        2. Specificity & Grounding: You MUST use real numbers, dates, offers, and local facts strictly from the Context below. DO NOT invent or hallucinate facts.
-        3. Citations & Constraints: If the trigger mentions research, explicitly cite the source. If suggesting an offer, strictly check its day-restrictions (e.g., 'Tue-Thu'). If it conflicts with an event (like an IPL match), surface this restriction explicitly!
+        2. Specificity & Grounding: You MUST use real numbers, dates, offers, and local facts (like 'locality') strictly from the Context below (e.g. from customer_aggregate, performance). DO NOT invent or hallucinate facts.
+        3. Citations & Constraints: If the trigger mentions research or compliance alerts, explicitly cite the source. If suggesting an offer, strictly check its day-restrictions (e.g., 'Tue-Thu'). If it conflicts with an event (like an IPL match), surface this restriction explicitly!
         4. Category Vocabulary: Use domain-specific terms (e.g. 'covers' for restaurants, 'conversion' for gyms, 'fluoride' for dentists).
         ${
           isCustomerScoped
             ? "5. Call To Action: End with ONE simple question to the customer to book or engage (e.g., 'Would you like to book a slot for this week?')."
-            : "5. Judgment & CTA: If a trigger implies a bad outcome, advise on a counter-strategy. End with ONE simple, low-effort next step (e.g., 'Want me to draft a WhatsApp? Reply YES.')."
+            : `5. Judgment: Do not just blindly follow the trigger. If it implies a bad outcome, advise on a smart, data-informed counter-strategy.
+        6. Engagement Compulsion: End with ONE simple, low-effort next step (e.g., "Want me to draft a 3-line WhatsApp? Reply YES.").`
         }
 
         Category Context: ${JSON.stringify(categoryData)}
@@ -202,9 +203,13 @@ app.post("/v1/reply", async (req, res) => {
   const triggerId = Object.keys(contexts.trigger)[0];
   const triggerData = triggerId ? contexts.trigger[triggerId]?.payload : {};
 
+  const isCustomerReply = from_role === "customer";
+  const merchantName = merchantData?.owner_first_name || "Merchant";
+  const customerName = customerData?.name || "Customer";
+
   const prompt = `
-    You are Vera, an AI assistant for merchant growth at magicpin.
-    The merchant has replied to our previous message.
+    You are ${isCustomerReply ? "the merchant (" + merchantName + ")" : "Vera, an AI assistant for merchant growth at magicpin"}.
+    The ${isCustomerReply ? "customer" : "merchant"} has replied to your previous message.
     
     Category Context: ${JSON.stringify(categoryData)}
     Merchant Context: ${JSON.stringify(merchantData)}
@@ -212,17 +217,23 @@ app.post("/v1/reply", async (req, res) => {
     ${customerData ? `Customer Context: ${JSON.stringify(customerData)}` : ""}
 
     Current Turn Number: ${turn_number}
-    Merchant's message: "${message}"
+    ${isCustomerReply ? "Customer" : "Merchant"}'s message: "${message}"
     
     Determine the next action. You can "send" a message, "wait" for more input, or "end" the conversation.
     
     RULES:
-    1. Hostile: If the merchant is hostile, rude, or asks to stop messaging, action MUST be "end".
-    2. Auto-reply: If the merchant's message looks like an automated out-of-office or generic auto-reply:
-       - If Current Turn Number is 1, action MUST be "wait".
-       - If Current Turn Number is >= 2, action MUST be "end".
-    3. Commitment: If the merchant agrees, commits ("lets do it"), or asks a follow-up, action MUST be "send". DO NOT ask another qualifying question. Immediately execute the task (e.g., write the ACTUAL drafted message text in your response).
-    4. Offer Constraints: If suggesting an offer to the merchant or drafting a message, strictly check its day-restrictions (e.g. 'Tue-Thu'). If it conflicts with an event (like an IPL match), explicitly state the restriction.
+    ${isCustomerReply ? 
+      `1. Addressing: You are replying to the CUSTOMER. Address them by their name (${customerName}). Do NOT address the merchant.
+       2. Action: If the customer agrees to book or asks a question, action MUST be "send" and you must reply directly to them fulfilling their request.
+       3. Hostile/Stop: If the customer asks to stop messaging or is hostile, action MUST be "end".`
+    : 
+      `1. Hostile: If the merchant is hostile, rude, or asks to stop messaging, action MUST be "end".
+       2. Auto-reply: If the merchant's message looks like an automated out-of-office or generic auto-reply:
+          - If Current Turn Number is 2 (this is their first reply), action MUST be "wait". DO NOT return "end".
+          - If Current Turn Number is >= 3 (repeated auto-replies), action MUST be "end".
+       3. Commitment: If the merchant agrees, commits ("lets do it"), or asks a follow-up, action MUST be "send". DO NOT ask another qualifying question. Immediately execute the task (e.g., write the ACTUAL drafted message text in your response).
+       4. Offer Constraints: If suggesting an offer to the merchant or drafting a message, strictly check its day-restrictions (e.g. 'Tue-Thu'). If it conflicts with an event (like an IPL match), explicitly state the restriction.`
+    }
     5. Rationale: Keep the rationale concise and strictly reflective of your actual reasoning.
     
     Return ONLY a valid JSON object with this exact structure (no markdown):
