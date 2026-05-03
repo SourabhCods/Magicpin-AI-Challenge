@@ -14,6 +14,9 @@ const contexts = {
   trigger: {},
 };
 
+// Conversation history tracking
+const conversations = {};
+
 // 1. Liveness Probe
 app.get("/v1/healthz", (req, res) => {
   res.json({
@@ -36,6 +39,7 @@ app.get("/v1/metadata", (req, res) => {
     model: "llama-3.3-70b-versatile",
     approach: "single-prompt composer with retrieval",
     version: "1.0.0",
+    submitted_at: new Date().toISOString(),
   });
 });
 
@@ -44,7 +48,11 @@ app.post("/v1/context", (req, res) => {
   const { scope, context_id, version, payload, delivered_at } = req.body;
 
   if (!contexts[scope]) {
-    return res.status(400).json({ error: "Invalid scope" });
+    return res.status(400).json({
+      accepted: false,
+      reason: "invalid_scope",
+      details: `Scope must be one of: category, merchant, customer, trigger. Received: ${scope}`,
+    });
   }
 
   // Idempotency / Version check
@@ -102,7 +110,26 @@ app.post("/v1/tick", async (req, res) => {
           ? contexts.customer[customerId]?.payload
           : null;
 
+        // Customer-scoped triggers must compose customer-facing messages
         const isCustomerScoped = !!customerData;
+
+        const triggerKind = triggerData.kind || "generic";
+        const templateNameMap = {
+          research_digest: "vera_research_digest_v1",
+          recall_due: "vera_customer_recall_v1",
+          perf_spike: "vera_perf_insight_v1",
+          perf_dip: "vera_performance_alert_v1",
+          milestone_reached: "vera_milestone_celebration_v1",
+          dormant_with_vera: "vera_engagement_reactivation_v1",
+          customer_lapsed_soft: "vera_customer_retention_v1",
+          review_theme_emerged: "vera_review_insight_v1",
+          festival_upcoming: "vera_festival_campaign_v1",
+          weather_heatwave: "vera_weather_response_v1",
+          competitor_opened: "vera_competitive_response_v1",
+          regulation_change: "vera_compliance_alert_v1",
+        };
+        const templateName =
+          templateNameMap[triggerKind] || "vera_generic_message_v1";
 
         const prompt = `
         You are Vera, an elite AI assistant for merchant growth at magicpin.
@@ -111,6 +138,9 @@ app.post("/v1/tick", async (req, res) => {
             ? "Compose a short, highly-compelling business message TO THE CUSTOMER on behalf of the merchant."
             : "Compose a short, highly-compelling business message to send to the merchant."
         }
+        
+        MESSAGE TEMPLATE: ${templateName}
+        TRIGGER KIND: ${triggerKind}
         
         CRITICAL RULES:
         ${
@@ -138,6 +168,7 @@ app.post("/v1/tick", async (req, res) => {
             "body": "The actual message",
             "cta": "open_ended or binary_yes_no",
             "suppression_key": "a unique string for this message type",
+            "template_params": ["param1_value", "param2_value"],
             "rationale": "A concise explanation of your reasoning"
         }
       `;
@@ -151,13 +182,31 @@ app.post("/v1/tick", async (req, res) => {
           });
 
           const result = JSON.parse(completion.choices[0].message.content);
+          const convId = `conv_${merchantId}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+          // Store conversation in history
+          conversations[convId] = {
+            merchant_id: merchantId,
+            customer_id: customerId,
+            trigger_id: triggerId,
+            turns: [
+              {
+                turn: 1,
+                from: "vera",
+                message: result.body,
+                timestamp: new Date().toISOString(),
+              },
+            ],
+          };
 
           return {
-            conversation_id: `conv_${merchantId}_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+            conversation_id: convId,
             merchant_id: merchantId,
             customer_id: customerId,
             send_as: customerId ? "merchant_on_behalf" : "vera",
             trigger_id: triggerId,
+            template_name: templateName,
+            template_params: result.template_params || [],
             body: result.body,
             cta: result.cta,
             suppression_key: result.suppression_key || `trigger:${triggerId}`,
@@ -208,8 +257,8 @@ app.post("/v1/reply", async (req, res) => {
   const customerName = customerData?.name || "Customer";
 
   const prompt = `
-    You are ${isCustomerReply ? "the merchant (" + merchantName + ")" : "Vera, an AI assistant for merchant growth at magicpin"}.
-    The ${isCustomerReply ? "customer" : "merchant"} has replied to your previous message.
+    You are ${isCustomerReply ? "Vera, an AI assistant for the merchant (" + merchantName + "). You are handling customer conversations on behalf of the merchant." : "Vera, an AI assistant for merchant growth at magicpin"}.
+    The ${isCustomerReply ? "customer (" + customerName + ")" : "merchant"} has replied to your previous message.
     
     Category Context: ${JSON.stringify(categoryData)}
     Merchant Context: ${JSON.stringify(merchantData)}
@@ -217,22 +266,22 @@ app.post("/v1/reply", async (req, res) => {
     ${customerData ? `Customer Context: ${JSON.stringify(customerData)}` : ""}
 
     Current Turn Number: ${turn_number}
-    ${isCustomerReply ? "Customer" : "Merchant"}'s message: "${message}"
+    ${isCustomerReply ? "Customer (" + customerName + ")" : "Merchant"}'s message: "${message}"
     
     Determine the next action. You can "send" a message, "wait" for more input, or "end" the conversation.
     
     RULES:
-    ${isCustomerReply ? 
-      `1. Addressing: You are replying to the CUSTOMER. Address them by their name (${customerName}). Do NOT address the merchant.
+    ${
+      isCustomerReply
+        ? `1. Addressing: You are replying to the CUSTOMER. Address them by their name (${customerName}). Do NOT address the merchant.
        2. Action: If the customer agrees to book or asks a question, action MUST be "send" and you must reply directly to them fulfilling their request.
        3. Hostile/Stop: If the customer asks to stop messaging or is hostile, action MUST be "end".`
-    : 
-      `1. Hostile: If the merchant is hostile, rude, or asks to stop messaging, action MUST be "end".
-       2. Auto-reply: If the merchant's message looks like an automated out-of-office or generic auto-reply:
-          - If Current Turn Number is 2 (this is their first reply), action MUST be "wait". DO NOT return "end".
-          - If Current Turn Number is >= 3 (repeated auto-replies), action MUST be "end".
-       3. Commitment: If the merchant agrees, commits ("lets do it"), or asks a follow-up, action MUST be "send". DO NOT ask another qualifying question. Immediately execute the task (e.g., write the ACTUAL drafted message text in your response).
-       4. Offer Constraints: If suggesting an offer to the merchant or drafting a message, strictly check its day-restrictions (e.g. 'Tue-Thu'). If it conflicts with an event (like an IPL match), explicitly state the restriction.`
+        : `1. Hostile: If the merchant is hostile, rude, or asks to stop messaging, action MUST be "end".
+       2. Auto-reply: If the merchant's message looks like an automated out-of-office or generic auto-reply (e.g., "Thank you for contacting", "I will get back"):
+          - If Current Turn Number is 2 (merchant's first reply), action MUST be "wait" with wait_seconds=3600 (don't end yet).
+          - If Current Turn Number is >= 3 and this also looks like auto-reply, action MUST be "end".
+       3. Commitment: If the merchant agrees, commits ("lets do it", "sure", "yes"), or asks follow-ups, action MUST be "send". DO NOT re-ask qualifying questions. Immediately execute the task.
+       4. Offer Constraints: If suggesting an offer, strictly check day-restrictions (e.g., 'Tue-Thu'). If it conflicts with events like IPL matches, explicitly state the restriction.`
     }
     5. Rationale: Keep the rationale concise and strictly reflective of your actual reasoning.
     
@@ -265,6 +314,24 @@ app.post("/v1/reply", async (req, res) => {
 
     if (result.action === "wait") {
       responsePayload.wait_seconds = result.wait_seconds || 14400; // default to 4 hours if not specified
+    }
+
+    // Update conversation history with this turn
+    if (conversations[conversation_id]) {
+      conversations[conversation_id].turns.push({
+        turn: turn_number,
+        from: from_role,
+        message: message,
+        timestamp: new Date().toISOString(),
+      });
+      if (result.action === "send") {
+        conversations[conversation_id].turns.push({
+          turn: turn_number + 1,
+          from: from_role === "merchant" ? "vera" : "merchant",
+          message: result.body,
+          timestamp: new Date().toISOString(),
+        });
+      }
     }
 
     res.json(responsePayload);
